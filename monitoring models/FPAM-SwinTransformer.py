@@ -75,6 +75,13 @@ def window_reverse(windows, window_size, H, W):
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
 
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.init import trunc_normal_
+from torch.nn.utils import prune
+
 class WindowAttention(nn.Module):
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0., use_sparse_attention=True):
         super().__init__()
@@ -530,22 +537,40 @@ class ExpandedConv(nn.Module):
         x = self.depthwise(x)
         x = self.pointwise(x)
         return x
+class SEBlock(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
 class BasicUnit(nn.Module):
     def __init__(self, in_channels, out_channels, expansion_factors):
         super(BasicUnit, self).__init__()
         self.branches = nn.ModuleList()
         for factor in expansion_factors:
             layers = []
-            layers.append(ExpandedConv(in_channels, out_channels, factor))  # 扩展卷积层
-            layers.append(nn.BatchNorm2d(out_channels))  # 添加BN层
+            layers.append(ExpandedConv(in_channels, out_channels, factor))
+            layers.append(nn.BatchNorm2d(out_channels))
+            layers.append(SEBlock(out_channels))  
             self.branches.append(nn.Sequential(*layers))
 
     def forward(self, x):
         outputs = [branch(x) for branch in self.branches]
         return sum(outputs)
-class DualBranchModule(nn.Module):
+class Parallelactivationmodule(nn.Module):
     def __init__(self, in_channels, out_channels, expansion_factors):
-        super(DualBranchModule, self).__init__()
+        super(Parallelactivationmodule, self).__init__()
         self.branch1 = nn.Sequential(
             BasicUnit(in_channels, out_channels, expansion_factors),
             nn.ReLU()
@@ -574,7 +599,7 @@ class PatchEmbed(nn.Module):
         self.in_chans = in_chans
         self.embed_dim = embed_dim
 
-        # 不替换成深度可分离卷积，保留普通卷积
+      
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
 
         if norm_layer is not None:
@@ -603,7 +628,7 @@ class PatchEmbed(nn.Module):
         return flops
 
 
-class FPAMSwinTransformer(nn.Module):
+class FLattenSwinTransformer(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
           https://arxiv.org/pdf/2103.14030
@@ -647,7 +672,7 @@ class FPAMSwinTransformer(nn.Module):
         self.mlp_ratio = mlp_ratio
 
         # 添加 DualBranchModule
-        self.dual_branch_module = DualBranchModule(in_channels=in_chans, 
+        self.parallel_activation_module = Parallelactivationmodule(in_channels=in_chans, 
                                                    out_channels=embed_dim, 
                                                    expansion_factors=[1, 2, 4])
 
@@ -714,8 +739,8 @@ class FPAMSwinTransformer(nn.Module):
         return {'relative_position_bias_table'}
 
     def forward_features(self, x):
-        # 首先通过 DualBranchModule
-        x = self.dual_branch_module(x)
+        # 首先通过 Parallelactivationmodule
+        x = self.parallel_activation_module(x)
 
         # 接着是 Patch Embedding
         x = self.patch_embed(x)
@@ -744,8 +769,5 @@ class FPAMSwinTransformer(nn.Module):
         flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2 ** self.num_layers)
         flops += self.num_features * self.num_classes
         return flops
-# 设备检测，若未检测到cuda设备则在CPU上运行
-device = torch.device("cuda" )
 
-# 定义模型、优化器、损失函数
-model = FPAMSwinTransformer().to(device)
+device = torch.device("cuda" )
